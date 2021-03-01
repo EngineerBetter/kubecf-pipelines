@@ -1,0 +1,359 @@
+resource_types:
+- name: terraform
+  type: registry-image
+  source:
+    repository: ljfranklin/terraform-resource
+    tag: latest
+
+- name: gcs
+  type: registry-image
+  source:
+    repository: frodenas/gcs-resource
+
+- name: helm
+  type: docker-image
+  source:
+    repository: typositoire/concourse-helm3-resource
+
+resources:
+- name: kubecf-pipelines
+  type: git
+  source:
+    uri: git@github.com:EngineerBetter/kubecf-pipelines.git
+
+- name: regularly
+  type: time
+  source:
+    interval: 15m
+
+- name: pcf-ops-image
+  type: registry-image
+  icon: docker
+  source:
+    repository: engineerbetter/pcf-ops
+
+- name: project-terraform
+  type: terraform
+  icon: terraform
+  source:
+    env_name: default
+    backend_type: gcs
+    backend_config:
+      bucket: ((terraform_backend_bucket))
+      prefix: terraform/project
+    env:
+      GOOGLE_CREDENTIALS: ((gcp_credentials_json))
+    vars:
+      project_id: ((gcp_project_id))
+
+- name: gke-terraform
+  type: terraform
+  icon: terraform
+  source:
+    env_name: default
+    backend_type: gcs
+    backend_config:
+      bucket: ((terraform_backend_bucket))
+      prefix: terraform/gke
+    env:
+      GOOGLE_CREDENTIALS: ((gcp_credentials_json))
+    vars:
+      project_id: ((gcp_project_id))
+      region: ((region))
+      node_counts_per_zone: ((node_counts_per_zone))
+
+- name: kubecf-terraform
+  type: terraform
+  icon: terraform
+  source:
+    env_name: default
+    backend_type: gcs
+    backend_config:
+      bucket: ((terraform_backend_bucket))
+      prefix: terraform/kubecf
+    env:
+      GOOGLE_CREDENTIALS: ((gcp_credentials_json))
+      #! The ACME provider needs creds from a different env var
+      GCE_SERVICE_ACCOUNT: ((gcp_credentials_json))
+    vars:
+      project_id: ((gcp_project_id))
+      region: ((region))
+      dns_zone_name: ((dns_zone_name))
+
+- name: minibroker
+  type: helm
+  source:
+    release: minibroker
+    # Required as default repo is now broken
+    stable_repo: https://charts.helm.sh/stable
+    repos:
+    - name: minibroker
+      url: https://minibroker.blob.core.windows.net/charts
+
+- name: kubecf-release
+  type: s3
+  version:
+    path: kubecf-bundle-v2.7.12.tgz
+  source:
+    bucket: kubecf
+    region_name: us-west-2
+    regexp: kubecf-bundle-v(.*).tgz
+
+- name: cf-operator
+  type: helm
+  source:
+    release: cf-operator
+
+- name: kubecf
+  type: helm
+  source:
+    release: kubecf
+
+- name: concourse-tasks
+  type: git
+  icon: github
+  source:
+    uri: git@github.com:EngineerBetter/concourse-tasks.git
+
+jobs:
+- name: setup-project
+  plan:
+  - in_parallel:
+    - get: kubecf-pipelines
+      trigger: true
+  - put: project-terraform
+    params:
+      terraform_source: kubecf-pipelines/terraform/project
+
+- name: create-cluster
+  serial: true
+  plan:
+  - get: kubecf-pipelines
+    trigger: true
+    passed: [setup-project]
+  - get: project-terraform
+    passed: [setup-project]
+  - put: gke-terraform
+    params:
+      terraform_source: kubecf-pipelines/terraform/gke
+
+- name: deploy-kubecf
+  serial: true
+  plan:
+  - in_parallel:
+    - get: kubecf-pipelines
+      trigger: true
+      passed: [create-cluster]
+    - get: kubecf-release
+      trigger: true
+      params:
+        unpack: true
+    - get: concourse-tasks
+    - get: pcf-ops-image
+  - task: generate-kubeconfig
+    file: kubecf-pipelines/ci/tasks/generate-kubeconfig/task.yml
+    params:
+      CLUSTER: kubecf
+      GOOGLE_CREDENTIALS: ((gcp_credentials_json))
+  - put: kubecf-terraform
+    params:
+      terraform_source: kubecf-pipelines/terraform/kubecf
+    get_params:
+      output_statefile: true
+  - task: get-terraform-outputs-as-json
+    file: concourse-tasks/get-terraform-outputs-as-json/task.yml
+    input_mapping:
+      state: kubecf-terraform
+  - put: cf-operator
+    params:
+      namespace: cf-operator
+      create_namespace: true
+      chart: kubecf-release/cf-operator.tgz
+      kubeconfig_path: kubeconfig/kubeconfig
+      override_values:
+      - key: global.singleNamespace.name
+        value: "kubecf"
+      - key: global.contextTimeout
+        value: 600
+      - key: global.meltdownDuration
+        value: 120
+      - key: global.meltdownRequeueAfter
+        value: 60
+      check_is_ready: true
+    get_params:
+      kubeconfig_path: kubeconfig/kubeconfig
+  - task: generate-kubecf-helm-chart-values
+    image: pcf-ops-image
+    file: kubecf-pipelines/ci/tasks/generate-kubecf-helm-chart-values/task.yml
+    params:
+      SYSTEM_DOMAIN: ((domain))
+  - put: kubecf
+    params:
+      namespace: kubecf
+      chart: kubecf-release/kubecf_release.tgz
+      kubeconfig_path: kubeconfig/kubeconfig
+      values: values/values.json
+      check_is_ready: true
+      timeout: 10m0s
+    get_params:
+      kubeconfig_path: kubeconfig/kubeconfig
+  - task: wait-for-kubecf
+    file: kubecf-pipelines/ci/tasks/wait-for-kubecf/task.yml
+
+- name: run-smoke-tests
+  serial: true
+  plan:
+  - in_parallel:
+    - get: kubecf-pipelines
+      trigger: true
+      passed: [deploy-kubecf]
+    - get: regularly
+      trigger: true
+  - task: generate-kubeconfig
+    file: kubecf-pipelines/ci/tasks/generate-kubeconfig/task.yml
+    params:
+      CLUSTER: kubecf
+      GOOGLE_CREDENTIALS: ((gcp_credentials_json))
+  - task: run-smoke-tests
+    file: kubecf-pipelines/ci/tasks/smoke-test/task.yml
+
+- name: deploy-minibroker
+  serial: true
+  plan:
+  - in_parallel:
+    - get: kubecf-pipelines
+      trigger: true
+      passed: [run-smoke-tests]
+  - task: generate-kubeconfig
+    file: kubecf-pipelines/ci/tasks/generate-kubeconfig/task.yml
+    params:
+      CLUSTER: kubecf
+      GOOGLE_CREDENTIALS: ((gcp_credentials_json))
+  - put: minibroker
+    params:
+      chart: minibroker/minibroker
+      kubeconfig_path: kubeconfig/kubeconfig
+      namespace: minibroker
+      create_namespace: true
+      override_values:
+      - key: deployServiceCatalog
+        value: "false"
+      - key: defaultNamespace
+        value: minibroker
+    get_params:
+      kubeconfig_path: kubeconfig/kubeconfig
+  - task: register-broker
+    config:
+      image_resource:
+        type: registry-image
+        source:
+          repository: engineerbetter/pcf-ops
+      platform: linux
+      inputs:
+      - name: kubeconfig
+      - name: kubecf-pipelines
+      params:
+        KUBECONFIG: kubeconfig/kubeconfig
+      run:
+        path: bash
+        args:
+        - -euc
+        - |
+          # wait 30 minutes for minibroker to be ready
+          kubectl -n minibroker wait --for condition=available deployment.apps/minibroker-minibroker --timeout=1800s
+
+          cf_password="$(kubectl get secret -n kubecf var-cf-admin-password -ojson | jq -r '.data.password' | base64 --decode)"
+          cf_username="admin"
+          cf api https://api.((domain))
+          cf auth "${cf_username}" "${cf_password}"
+          cf target -o system
+          cf create-space system
+          cf target -o system -s system
+
+          if ! cf service-brokers | grep minibroker; then
+            cf create-service-broker minibroker user pass http://minibroker-minibroker.minibroker.svc.cluster.local
+          fi
+
+          cf enable-service-access mariadb
+          cf enable-service-access mongodb
+          cf enable-service-access mysql
+          cf enable-service-access postgresql
+          cf enable-service-access rabbitmq
+          cf enable-service-access redis
+
+          cf marketplace
+
+- name: destroy-kubecf
+  serial: true
+  plan:
+  - in_parallel:
+    - get: kubecf-pipelines
+      passed: [deploy-kubecf]
+    - get: kubecf-release
+      params:
+        globs: [kubecf-bundle-*.tgz]
+    - get: concourse-tasks
+  - in_parallel:
+    - task: untar-kubecf
+      file: concourse-tasks/untar/task.yml
+      input_mapping:
+        input: kubecf-release
+      params:
+        TARBALL_PATH: kubecf-bundle-*.tgz
+      output_mapping:
+        output: kubecf-bundle-contents
+    - task: generate-kubeconfig
+      file: kubecf-pipelines/ci/tasks/generate-kubeconfig/task.yml
+      params:
+        CLUSTER: kubecf
+        GOOGLE_CREDENTIALS: ((gcp_credentials_json))
+  - put: kubecf
+    params:
+      namespace: kubecf
+      chart: kubecf-bundle-contents/kubecf_release.tgz
+      release: kubecf
+      delete: true
+      kubeconfig_path: kubeconfig/kubeconfig
+      timeout: 10m0s
+    get_params:
+      kubeconfig_path: kubeconfig/kubeconfig
+  - put: cf-operator
+    params:
+      namespace: cf-operator
+      chart: kubecf-bundle-contents/cf-operator.tgz
+      release: cf-operator
+      delete: true
+      kubeconfig_path: kubeconfig/kubeconfig
+    get_params:
+      kubeconfig_path: kubeconfig/kubeconfig
+  - put: kubecf-terraform
+    params:
+      terraform_source: kubecf-pipelines/terraform/kubecf
+      action: destroy
+    get_params:
+      action: destroy
+
+- name: destroy-cluster
+  serial: true
+  plan:
+  - get: kubecf-pipelines
+    passed: [destroy-kubecf]
+  - put: gke-terraform
+    params:
+      terraform_source: kubecf-pipelines/terraform/gke
+      action: destroy
+    get_params:
+      action: destroy
+
+groups:
+- name: create
+  jobs:
+  - setup-project
+  - create-cluster
+  - deploy-kubecf
+  - deploy-minibroker
+  - run-smoke-tests
+- name: teardown
+  jobs:
+  - destroy-kubecf
+  - destroy-cluster

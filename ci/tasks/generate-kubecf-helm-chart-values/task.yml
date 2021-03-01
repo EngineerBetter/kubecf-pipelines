@@ -1,0 +1,14 @@
+platform: linux
+
+inputs:
+- name: kubecf-pipelines
+- name: outputs
+
+outputs:
+- name: values
+
+run:
+  path: kubecf-pipelines/ci/tasks/generate-kubecf-helm-chart-values/task.sh
+
+params:
+  SYSTEM_DOMAIN:

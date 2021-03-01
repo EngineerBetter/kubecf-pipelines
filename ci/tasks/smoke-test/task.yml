@@ -1,0 +1,17 @@
+platform: linux
+
+image_resource:
+  type: registry-image
+  source:
+    repository: bitnami/kubectl
+
+inputs:
+- name: kubecf-pipelines
+- name: kubeconfig
+
+params:
+  KUBECF_NS: kubecf
+  KUBECONFIG: kubeconfig/kubeconfig
+
+run:
+  path: kubecf-pipelines/ci/tasks/smoke-test/task.sh

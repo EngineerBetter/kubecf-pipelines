@@ -1,0 +1,36 @@
+platform: linux
+
+image_resource:
+  type: registry-image
+  source:
+    repository: engineerbetter/pcf-ops
+
+outputs:
+- name: kubeconfig
+
+run:
+  path: bash
+  args:
+  - -euo
+  - pipefail
+  - -c
+  - |
+    export KUBECONFIG=kubeconfig.raw
+    export GOOGLE_APPLICATION_CREDENTIALS=google-application-credentials.json
+    echo "${GOOGLE_CREDENTIALS}" > $GOOGLE_APPLICATION_CREDENTIALS
+    gcloud auth activate-service-account --key-file=$GOOGLE_APPLICATION_CREDENTIALS --project="$(echo $GOOGLE_CREDENTIALS | jq -r '.project_id')"
+
+    region="${REGION:-$(gcloud container clusters list --filter "name=$CLUSTER" --format='value(location)')}"
+    gcloud config set container/use_application_default_credentials true
+    gcloud container clusters get-credentials "${CLUSTER}" --region "${region}"
+
+    # Trigger a request so that we get a token
+    kubectl cluster-info
+
+    # Move access-token to token field to avoid consumers having to call GCP helper with GCP creds
+    yq eval '.users[0].user.token = .users[0].user.auth-provider.config.access-token | del(.users[0].user.auth-provider)' $KUBECONFIG > kubeconfig/kubeconfig
+
+params:
+  GOOGLE_CREDENTIALS:
+  REGION:
+  CLUSTER:
