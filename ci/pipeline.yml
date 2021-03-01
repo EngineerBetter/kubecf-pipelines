@@ -19,7 +19,7 @@ resources:
 - name: kubecf-pipelines
   type: git
   source:
-    uri: git@github.com:EngineerBetter/kubecf-pipelines.git
+    uri: https://github.com/EngineerBetter/kubecf-pipelines
 
 - name: regularly
   type: time
@@ -113,7 +113,7 @@ resources:
   type: git
   icon: github
   source:
-    uri: git@github.com:EngineerBetter/concourse-tasks.git
+    uri: https://github.com/EngineerBetter/concourse-tasks
 
 jobs:
 - name: setup-project
