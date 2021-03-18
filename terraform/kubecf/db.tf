@@ -19,8 +19,12 @@ resource "google_compute_global_address" "db" {
   network       = data.google_compute_network.default.self_link
 }
 
+resource "random_id" "db_name" {
+  byte_length = 3
+}
+
 resource "google_sql_database_instance" "kubecf" {
-  name             = "kubecf"
+  name             = "kubecf-${random_id.db_name.hex}"
   database_version = "MYSQL_5_7"
   region           = var.region
 
@@ -28,7 +32,6 @@ resource "google_sql_database_instance" "kubecf" {
 
   settings {
     tier = "db-g1-small"
-
 
     ip_configuration {
       ipv4_enabled    = false
